@@ -73,8 +73,8 @@ The sample response is a transcript: page fetches, hub calls sent, and the serve
 com.blazemeter.jmeter.blazor.BlazorSampler          sampler, GUI class is BlazorSamplerGui
 com.blazemeter.jmeter.blazor.BlazorRecorder         recorder element, GUI class is BlazorRecorderGui
 com.blazemeter.jmeter.blazor.protocol               JSON, MessagePack, blazorpack frames, HTML markers
-com.blazemeter.jmeter.blazor.client.BlazorSession   one circuit
+com.blazemeter.jmeter.blazor.client.BlazorSession   one circuit; HTTP and WebSocket go through Jetty 12
 com.blazemeter.jmeter.blazor.recorder               proxy and WebSocket frames
 ```
 
-The jar has no third-party libraries. JMeter is `provided`. MessagePack and the SignalR length prefix are implemented here, matching the `blazorpack` protocol version the browser sends when stateful reconnect is off (`version: 1`).
+The jar embeds Jetty 12 for HTTP and WebSocket, so install is still one file in `lib/ext`. JMeter is `provided`. MessagePack and the SignalR length prefix are implemented here, matching the `blazorpack` protocol version the browser sends when stateful reconnect is off (`version: 1`).

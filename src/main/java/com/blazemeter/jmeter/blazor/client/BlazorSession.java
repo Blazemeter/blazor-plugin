@@ -4,15 +4,11 @@ import com.blazemeter.jmeter.blazor.protocol.BlazorPack;
 import com.blazemeter.jmeter.blazor.protocol.Json;
 import com.blazemeter.jmeter.blazor.protocol.PageDocument;
 import com.blazemeter.jmeter.blazor.protocol.PageDocument.Marker;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.net.ProxySelector;
 import java.net.URI;
 import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpHeaders;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -20,14 +16,35 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.zip.GZIPInputStream;
+import org.eclipse.jetty.client.CompletableResponseListener;
+import org.eclipse.jetty.client.ContentResponse;
+import org.eclipse.jetty.client.HttpClient;
+import org.eclipse.jetty.client.HttpProxy;
+import org.eclipse.jetty.client.BytesRequestContent;
+import org.eclipse.jetty.client.Request;
+import org.eclipse.jetty.http.HttpCookieStore;
+import org.eclipse.jetty.http.HttpField;
+import org.eclipse.jetty.http.HttpFields;
+import org.eclipse.jetty.http.HttpHeader;
+import org.eclipse.jetty.http.HttpMethod;
+import org.eclipse.jetty.websocket.api.Callback;
+import org.eclipse.jetty.util.thread.QueuedThreadPool;
+import org.eclipse.jetty.websocket.api.Session;
+import org.eclipse.jetty.websocket.api.StatusCode;
+import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
+import org.eclipse.jetty.websocket.client.WebSocketClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,18 +55,19 @@ import org.slf4j.LoggerFactory;
  * in the HTML. Later navigations send {@code OnLocationChanged} and a fresh
  * root-component batch parsed from the enhanced-navigation response.
  * Render batches and JS calls are acknowledged so the circuit stays open.
+ * HTTP and the WebSocket are Jetty 12. One shared client serves every direct
+ * circuit; a session opened through a proxy gets its own client so other
+ * threads are not sent through that proxy. Cookies stay on the session, so
+ * virtual users do not share a jar.
  */
 public final class BlazorSession {
 
     static final String USER_AGENT = "bzm-blazor-plugin/0.1";
     private static final long SETTLE_MS = 600;
+    private static final int MAX_BODY = 16 * 1024 * 1024;
     private static final Logger LOG = LoggerFactory.getLogger(BlazorSession.class);
-
-    private static final HttpClient SHARED = HttpClient.newBuilder()
-            .version(HttpClient.Version.HTTP_1_1)
-            .followRedirects(HttpClient.Redirect.NORMAL)
-            .connectTimeout(Duration.ofSeconds(10))
-            .build();
+    private static final Object CLIENTS = new Object();
+    private static volatile JettyStack sharedStack;
 
     private final int timeoutMs;
     private final InetSocketAddress proxy;
@@ -58,8 +76,8 @@ public final class BlazorSession {
     private final LinkedBlockingQueue<Incoming> incoming = new LinkedBlockingQueue<>();
     private final LinkedHashMap<String, ActiveRoot> roots = new LinkedHashMap<>();
 
-    private HttpClient proxied;
-    private WebSocket webSocket;
+    private JettyStack transport;
+    private Session webSocket;
     private ScheduledExecutorService pings;
     private String baseUri = "";
     private String pageUri = "";
@@ -80,6 +98,7 @@ public final class BlazorSession {
     public synchronized String open(String pageUrl) throws BlazorException {
         beginCall();
         try {
+            this.transport = JettyStack.open(proxy);
             URI requested = URI.create(pageUrl);
             HttpResult home = get(requested, null);
             requireHttp(home, "page");
@@ -239,12 +258,14 @@ public final class BlazorSession {
         URI webSocketUri = new URI(scheme, http.getRawUserInfo(), http.getHost(), http.getPort(),
                 http.getRawPath(), http.getRawQuery(), null);
         log("WebSocket " + webSocketUri);
-        WebSocket.Builder builder = client().newWebSocketBuilder().header("User-Agent", USER_AGENT);
+        ClientUpgradeRequest upgrade = new ClientUpgradeRequest(webSocketUri);
+        upgrade.setHeader("User-Agent", USER_AGENT);
         String cookie = cookieHeader();
         if (!cookie.isEmpty()) {
-            builder.header("Cookie", cookie);
+            upgrade.setHeader("Cookie", cookie);
         }
-        this.webSocket = builder.buildAsync(webSocketUri, new Listener()).get(timeoutMs, TimeUnit.MILLISECONDS);
+        this.webSocket = transport.sockets.connect(new CircuitEndpoint(incoming), upgrade)
+                .get(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
     private void awaitHandshake() throws BlazorException {
@@ -375,67 +396,79 @@ public final class BlazorSession {
     }
 
     private void sendRaw(byte[] data) throws BlazorException {
-        WebSocket socket = this.webSocket;
+        Session socket = this.webSocket;
         if (socket == null) {
             throw failure("The circuit is not connected");
         }
+        awaitSend(callback -> socket.sendBinary(ByteBuffer.wrap(data), callback), "Failed to send on the circuit");
+    }
+
+    private void sendText(String text) throws BlazorException {
+        Session socket = this.webSocket;
+        if (socket == null) {
+            throw failure("The circuit is not connected");
+        }
+        awaitSend(callback -> socket.sendText(text, callback), "Failed to send the handshake");
+    }
+
+    private void awaitSend(Consumer<Callback> send, String failure) throws BlazorException {
+        CompletableFuture<Void> sent = new CompletableFuture<>();
+        send.accept(Callback.from(() -> sent.complete(null), sent::completeExceptionally));
         try {
-            socket.sendBinary(ByteBuffer.wrap(data), true).get(timeoutMs, TimeUnit.MILLISECONDS);
+            sent.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
             throw failure("Interrupted while sending");
         } catch (ExecutionException | TimeoutException ex) {
-            throw failure("Failed to send on the circuit: " + ex.getMessage());
-        }
-    }
-
-    private void sendText(String text) throws BlazorException {
-        WebSocket socket = this.webSocket;
-        if (socket == null) {
-            throw failure("The circuit is not connected");
-        }
-        try {
-            socket.sendText(text, true).get(timeoutMs, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            throw failure("Interrupted while sending the handshake");
-        } catch (ExecutionException | TimeoutException ex) {
-            throw failure("Failed to send the handshake: " + ex.getMessage());
+            throw failure(failure + ": " + ex.getMessage());
         }
     }
 
     private HttpResult get(URI uri, String accept) throws Exception {
-        HttpRequest.Builder builder = request(uri).GET();
+        Request request = request(uri).method(HttpMethod.GET);
         if (accept != null) {
-            builder.header("Accept", accept);
+            request.headers(headers -> headers.put(HttpHeader.ACCEPT, accept));
         }
-        return exchange(builder.build());
+        return exchange(request);
     }
 
     private HttpResult post(URI uri) throws Exception {
-        return exchange(request(uri).POST(HttpRequest.BodyPublishers.noBody()).build());
+        return exchange(request(uri).method(HttpMethod.POST).body(new BytesRequestContent(new byte[0])));
     }
 
-    private HttpResult exchange(HttpRequest request) throws Exception {
-        HttpResponse<String> response = client().send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        remember(response.headers());
-        return new HttpResult(response.statusCode(), response.uri(), response.body(), response.headers());
+    private HttpResult exchange(Request request) throws Exception {
+        AtomicReference<URI> landed = new AtomicReference<>(request.getURI());
+        request.onResponseBegin(response -> landed.set(response.getRequest().getURI()));
+        ContentResponse response = new CompletableResponseListener(request, MAX_BODY).send()
+                .get(timeoutMs, TimeUnit.MILLISECONDS);
+        remember(response.getHeaders());
+        URI finalUri = landed.get() == null ? response.getRequest().getURI() : landed.get();
+        byte[] content = response.getContent() == null ? new byte[0] : response.getContent();
+        if (header(response.getHeaders(), HttpHeader.CONTENT_ENCODING).toLowerCase(Locale.ROOT).contains("gzip")) {
+            content = gunzip(content);
+        }
+        return new HttpResult(response.getStatus(), finalUri, new String(content, StandardCharsets.UTF_8),
+                header(response.getHeaders(), "ssr-framing"));
     }
 
-    private HttpRequest.Builder request(URI uri) {
-        HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
-                .timeout(Duration.ofMillis(timeoutMs))
-                .header("User-Agent", USER_AGENT);
+    private Request request(URI uri) {
+        Request request = transport.http.newRequest(uri)
+                .timeout(timeoutMs, TimeUnit.MILLISECONDS)
+                .followRedirects(true)
+                .headers(headers -> headers.put(HttpHeader.ACCEPT_ENCODING, "identity"));
         String cookie = cookieHeader();
         if (!cookie.isEmpty()) {
-            builder.header("Cookie", cookie);
+            request.headers(headers -> headers.put(HttpHeader.COOKIE, cookie));
         }
-        return builder;
+        return request;
     }
 
-    private void remember(HttpHeaders headers) {
-        for (String setCookie : headers.allValues("set-cookie")) {
-            String pair = setCookie.split(";", 2)[0].trim();
+    private void remember(HttpFields headers) {
+        for (HttpField field : headers) {
+            if (field.getHeader() != HttpHeader.SET_COOKIE) {
+                continue;
+            }
+            String pair = field.getValue().split(";", 2)[0].trim();
             int equals = pair.indexOf('=');
             if (equals <= 0) {
                 continue;
@@ -446,23 +479,32 @@ public final class BlazorSession {
         }
     }
 
-    private String cookieHeader() {
-        return String.join("; ", cookies);
+    private static String header(HttpFields headers, HttpHeader name) {
+        for (HttpField field : headers) {
+            if (field.getHeader() == name) {
+                return field.getValue() == null ? "" : field.getValue();
+            }
+        }
+        return "";
     }
 
-    private HttpClient client() {
-        if (proxy == null) {
-            return SHARED;
+    private static String header(HttpFields headers, String name) {
+        for (HttpField field : headers) {
+            if (name.equalsIgnoreCase(field.getName())) {
+                return field.getValue() == null ? "" : field.getValue();
+            }
         }
-        if (proxied == null) {
-            proxied = HttpClient.newBuilder()
-                    .version(HttpClient.Version.HTTP_1_1)
-                    .followRedirects(HttpClient.Redirect.NORMAL)
-                    .connectTimeout(Duration.ofSeconds(10))
-                    .proxy(ProxySelector.of(proxy))
-                    .build();
+        return "";
+    }
+
+    private static byte[] gunzip(byte[] content) throws IOException {
+        try (GZIPInputStream in = new GZIPInputStream(new ByteArrayInputStream(content))) {
+            return in.readAllBytes();
         }
-        return proxied;
+    }
+
+    private String cookieHeader() {
+        return String.join("; ", cookies);
     }
 
     private String connectionToken(String body) throws BlazorException {
@@ -502,7 +544,7 @@ public final class BlazorSession {
     }
 
     private static String unframe(HttpResult page) {
-        String boundary = page.headers.firstValue("ssr-framing").orElse("");
+        String boundary = page.framing;
         if (boundary.isEmpty() || !page.body.contains(boundary)) {
             return page.body;
         }
@@ -554,20 +596,30 @@ public final class BlazorSession {
             pings.shutdownNow();
             pings = null;
         }
-        WebSocket socket = this.webSocket;
+        Session socket = this.webSocket;
         this.webSocket = null;
-        if (socket == null) {
-            return;
+        JettyStack stack = this.transport;
+        this.transport = null;
+        if (socket != null) {
+            try {
+                CompletableFuture<Void> sent = new CompletableFuture<>();
+                socket.sendBinary(ByteBuffer.wrap(BlazorPack.close()),
+                        Callback.from(() -> sent.complete(null), sent::completeExceptionally));
+                sent.get(2, TimeUnit.SECONDS);
+            } catch (Exception ignored) {
+                // The circuit may already be gone.
+            }
+            try {
+                CompletableFuture<Void> closed = new CompletableFuture<>();
+                socket.close(StatusCode.NORMAL, "",
+                        Callback.from(() -> closed.complete(null), closed::completeExceptionally));
+                closed.get(2, TimeUnit.SECONDS);
+            } catch (Exception ignored) {
+                socket.disconnect();
+            }
         }
-        try {
-            socket.sendBinary(ByteBuffer.wrap(BlazorPack.close()), true).get(2, TimeUnit.SECONDS);
-        } catch (Exception ignored) {
-            // The circuit may already be gone.
-        }
-        try {
-            socket.sendClose(WebSocket.NORMAL_CLOSURE, "").get(2, TimeUnit.SECONDS);
-        } catch (Exception ignored) {
-            socket.abort();
+        if (stack != null) {
+            stack.closeIfOwned();
         }
     }
 
@@ -610,49 +662,118 @@ public final class BlazorSession {
         return new BlazorException(message, callText(), ex);
     }
 
-    private final class Listener implements WebSocket.Listener {
-        private final java.io.ByteArrayOutputStream binary = new java.io.ByteArrayOutputStream();
-        private final StringBuilder text = new StringBuilder();
+    /**
+     * Public so Jetty can deliver events. Messages are copied out of Jetty's
+     * buffer and queued; the sampler thread is the one that interprets them.
+     */
+    public static final class CircuitEndpoint implements Session.Listener.AutoDemanding {
+        private final LinkedBlockingQueue<Incoming> incoming;
 
-        @Override
-        public void onOpen(WebSocket webSocket) {
-            webSocket.request(1);
+        CircuitEndpoint(LinkedBlockingQueue<Incoming> incoming) {
+            this.incoming = incoming;
         }
 
         @Override
-        public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
-            text.append(data);
-            if (last) {
-                incoming.offer(Incoming.data(text.toString().getBytes(StandardCharsets.UTF_8)));
-                text.setLength(0);
-            }
-            webSocket.request(1);
-            return null;
+        public void onWebSocketText(String message) {
+            incoming.offer(Incoming.data(message.getBytes(StandardCharsets.UTF_8)));
         }
 
         @Override
-        public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {
-            byte[] copy = new byte[data.remaining()];
-            data.get(copy);
-            binary.writeBytes(copy);
-            if (last) {
-                incoming.offer(Incoming.data(binary.toByteArray()));
-                binary.reset();
-            }
-            webSocket.request(1);
-            return null;
+        public void onWebSocketBinary(ByteBuffer payload, Callback callback) {
+            byte[] copy = new byte[payload.remaining()];
+            payload.get(copy);
+            incoming.offer(Incoming.data(copy));
+            callback.succeed();
         }
 
         @Override
-        public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+        public void onWebSocketClose(int statusCode, String reason) {
             incoming.offer(Incoming.error("WebSocket closed (" + statusCode + " " + reason + ")"));
-            return null;
         }
 
         @Override
-        public void onError(WebSocket webSocket, Throwable error) {
+        public void onWebSocketError(Throwable error) {
             String message = error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
             incoming.offer(Incoming.error("WebSocket error: " + message));
+        }
+    }
+
+    private static final class JettyStack {
+        private final HttpClient http;
+        private final WebSocketClient sockets;
+        private final boolean shared;
+
+        private JettyStack(HttpClient http, WebSocketClient sockets, boolean shared) {
+            this.http = http;
+            this.sockets = sockets;
+            this.shared = shared;
+        }
+
+        private static JettyStack open(InetSocketAddress proxy) throws Exception {
+            if (proxy == null) {
+                return shared();
+            }
+            HttpClient http = newHttpClient();
+            http.getProxyConfiguration().addProxy(new HttpProxy(proxy.getHostString(), proxy.getPort()));
+            return start(http, false);
+        }
+
+        private static JettyStack shared() throws Exception {
+            JettyStack existing = sharedStack;
+            if (existing != null) {
+                return existing;
+            }
+            synchronized (CLIENTS) {
+                if (sharedStack == null) {
+                    sharedStack = start(newHttpClient(), true);
+                }
+                return sharedStack;
+            }
+        }
+
+        private static HttpClient newHttpClient() {
+            QueuedThreadPool executor = new QueuedThreadPool();
+            executor.setName("blazor-jetty");
+            executor.setDaemon(true);
+            HttpClient http = new HttpClient();
+            http.setName("blazor-http");
+            http.setExecutor(executor);
+            http.setConnectTimeout(10_000);
+            http.setIdleTimeout(120_000);
+            http.setFollowRedirects(true);
+            // The shared client would otherwise mix cookies across virtual users.
+            http.setHttpCookieStore(new HttpCookieStore.Empty());
+            // One long-lived socket per virtual user, plus the short page fetches.
+            http.setMaxConnectionsPerDestination(100_000);
+            http.setUserAgentField(new HttpField(HttpHeader.USER_AGENT, USER_AGENT));
+            return http;
+        }
+
+        private static JettyStack start(HttpClient http, boolean sharedClient) throws Exception {
+            WebSocketClient sockets = new WebSocketClient(http);
+            sockets.setMaxBinaryMessageSize(MAX_BODY);
+            sockets.setMaxTextMessageSize(1024 * 1024);
+            sockets.setIdleTimeout(Duration.ofSeconds(120));
+            sockets.start();
+            return new JettyStack(http, sockets, sharedClient);
+        }
+
+        private void closeIfOwned() {
+            if (shared) {
+                return;
+            }
+            try {
+                sockets.stop();
+            } catch (Exception ignored) {
+                // The session is already finished.
+            }
+            try {
+                if (http.isRunning()) {
+                    http.stop();
+                }
+            } catch (Exception ignored) {
+                // Stopping the socket client usually stops this too.
+            }
         }
     }
 
@@ -678,13 +799,13 @@ public final class BlazorSession {
         private final int status;
         private final URI finalUri;
         private final String body;
-        private final HttpHeaders headers;
+        private final String framing;
 
-        private HttpResult(int status, URI finalUri, String body, HttpHeaders headers) {
+        private HttpResult(int status, URI finalUri, String body, String framing) {
             this.status = status;
             this.finalUri = finalUri;
             this.body = body;
-            this.headers = headers;
+            this.framing = framing == null ? "" : framing;
         }
     }
 

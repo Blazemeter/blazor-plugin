@@ -584,7 +584,11 @@ public final class RecordingProxy {
         Thread up = new Thread(() -> copyRaw(clientIn, origin), "blazor-recorder-tunnel-up");
         up.setDaemon(true);
         up.start();
-        copyRaw(origin.getInputStream(), clientOut);
+        try {
+            copyRaw(origin.getInputStream(), clientOut);
+        } catch (IOException ignored) {
+            // Either side hung up before the tunnel was fully open.
+        }
         try {
             up.join();
         } catch (InterruptedException ex) {

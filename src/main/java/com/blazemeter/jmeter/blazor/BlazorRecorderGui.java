@@ -71,6 +71,7 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
     private String serverOrigin = "";
     private String serverVariable = "";
     private transient JMeterTreeNode variablesNode;
+    private transient String certificateHint = "";
     private transient RecordingGroupWindow groupWindow;
     private transient List<JMeterTreeNode> recordedNodes = new ArrayList<>();
 
@@ -92,7 +93,7 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
 
         status.setEditable(false);
         status.setText("Point the browser HTTP and SOCKS proxy at 127.0.0.1 (or localhost) and this port.\n"
-                + "Samplers appear in the first thread group while you browse. HTTPS is tunneled and not recorded.\n"
+                + "Start recording, then trust the certificate path shown here. HTTPS is recorded, including sites that use HTTP/2.\n"
                 + "Each server is stored as ${SERVER_1}, ${SERVER_2}, and so on. A window stays on top so you can group steps.\n"
                 + "Stop, or close that window, to finish recording.");
         add(new JScrollPane(status), BorderLayout.SOUTH);
@@ -146,6 +147,12 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
             return;
         }
         running = proxy;
+        try {
+            certificateHint = "Trust this certificate in the browser to record HTTPS:\n"
+                    + proxy.ensureCertificate() + "\n";
+        } catch (Exception ex) {
+            certificateHint = "HTTPS certificate was not created: " + ex.getMessage() + "\n";
+        }
         start.setEnabled(false);
         groupWindow.show();
         refresher = new Timer(400, event -> refreshStatus());
@@ -176,6 +183,7 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
         }
         StringBuilder report = new StringBuilder();
         report.append("Recording on 127.0.0.1:").append(proxy.port()).append('\n');
+        report.append(certificateHint);
         if (serverOrigin.isEmpty()) {
             report.append("The server variable is empty until the app opens a circuit.\n");
         } else {

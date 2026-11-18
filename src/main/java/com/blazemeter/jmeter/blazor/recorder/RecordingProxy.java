@@ -14,6 +14,8 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import javax.net.ssl.SSLSocket;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -24,7 +26,9 @@ import java.util.function.Consumer;
 /**
  * HTTP proxy that forwards a browser and keeps the Blazor user actions:
  * the document URL that opened each circuit, location changes, and hub
- * invocations such as {@code BeginInvokeDotNetFromJS}.
+ * invocations such as {@code BeginInvokeDotNetFromJS}. HTTPS is decrypted
+ * with a local certificate authority. The browser is offered HTTP/1.1, so a
+ * site that prefers HTTP/2 is still recorded.
  */
 public final class RecordingProxy {
 
@@ -41,6 +45,10 @@ public final class RecordingProxy {
     private final List<String> seenRequests = new ArrayList<>();
     private final List<Socket> active = new CopyOnWriteArrayList<>();
     private final List<ServerSocket> listeners = new ArrayList<>();
+
+    private final RecordingTls tls = new RecordingTls(
+            Path.of(System.getProperty("user.home"), ".jmeter", "blazor-recorder"));
+    private volatile boolean trustAllOrigins;
 
     private ServerSocket server;
     private volatile boolean stopped;
@@ -130,6 +138,24 @@ public final class RecordingProxy {
         return List.copyOf(seenRequests);
     }
 
+    /** Certificate the browser must trust before an https app can be recorded. */
+    public Path ensureCertificate() throws IOException {
+        try {
+            tls.ensureCertificate();
+        } catch (Exception ex) {
+            throw new IOException("Could not create the recorder certificate: " + ex.getMessage(), ex);
+        }
+        return tls.certificateFile();
+    }
+
+    void setCertificateDirectory(Path directory) {
+        tls.setDirectory(directory);
+    }
+
+    void setTrustAllOrigins(boolean trustAllOrigins) {
+        this.trustAllOrigins = trustAllOrigins;
+    }
+
     /**
      * Turns one client WebSocket message into user-level steps. SignalR
      * lifecycle messages are dropped.
@@ -202,11 +228,11 @@ public final class RecordingProxy {
         }
         in.unread(first);
         if (first == 0x05) {
-            socks5(in, out);
+            socks5(client, in, out);
             return;
         }
         if (first == 0x04) {
-            socks4(in, out);
+            socks4(client, in, out);
             return;
         }
         String requestLine = readLine(in);
@@ -218,7 +244,7 @@ public final class RecordingProxy {
         }
         List<String> headers = readHeaders(in);
         if (requestLine.startsWith("CONNECT ")) {
-            tunnel(requestLine, in, out);
+            tunnel(client, requestLine, in, out);
             return;
         }
         String[] parts = requestLine.split(" ", 3);
@@ -228,10 +254,12 @@ public final class RecordingProxy {
         String target = absoluteTarget(parts[1], headers);
         URI uri = URI.create(target);
         byte[] requestBody = readBody(in, headers);
-        try (Socket origin = new Socket()) {
-            origin.connect(new InetSocketAddress(uri.getHost(), portOf(uri)), 15_000);
-            origin.setTcpNoDelay(true);
-            active.add(origin);
+        Socket tcp = new Socket();
+        tcp.connect(new InetSocketAddress(uri.getHost(), portOf(uri)), 15_000);
+        tcp.setTcpNoDelay(true);
+        Socket origin = openUpstream(tcp, uri.getHost(), portOf(uri), "https".equalsIgnoreCase(uri.getScheme()));
+        active.add(origin);
+        try (origin) {
             try {
                 OutputStream originOut = origin.getOutputStream();
                 InputStream originIn = origin.getInputStream();
@@ -392,7 +420,8 @@ public final class RecordingProxy {
         translated.forEach(this::notifyStep);
     }
 
-    private void tunnel(String requestLine, InputStream clientIn, OutputStream clientOut) throws IOException {
+    private void tunnel(Socket client, String requestLine, InputStream clientIn, OutputStream clientOut)
+            throws IOException {
         String hostPort = requestLine.split(" ")[1];
         String host = hostPort;
         int port = 443;
@@ -401,8 +430,11 @@ public final class RecordingProxy {
             host = hostPort.substring(0, colon);
             port = Integer.parseInt(hostPort.substring(colon + 1));
         }
-        try (Socket origin = new Socket()) {
-            origin.connect(new InetSocketAddress(host, port), 15_000);
+        Socket origin = new Socket();
+        origin.connect(new InetSocketAddress(host, port), 15_000);
+        origin.setTcpNoDelay(true);
+        active.add(origin);
+        try {
             clientOut.write("HTTP/1.1 200 Connection Established\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
             clientOut.flush();
             PushbackInputStream push = new PushbackInputStream(clientIn, 1);
@@ -411,11 +443,89 @@ public final class RecordingProxy {
                 return;
             }
             push.unread(first);
+            if (first == 0x16) {
+                interceptTls(client, push, origin, host, port, hostPort);
+                return;
+            }
             if (first >= 'A' && first <= 'Z') {
-                proxyTunnelledHttp(push, clientOut, origin, hostPort);
+                proxyTunnelledHttp(push, clientOut, origin, hostPort, "http");
                 return;
             }
             relay(push, clientOut, origin);
+        } finally {
+            active.remove(origin);
+            origin.close();
+        }
+    }
+
+    /**
+     * Decrypts a TLS tunnel and records the HTTP/1.1 conversation inside it.
+     * Browsers that prefer HTTP/2 still speak HTTP/1.1 here, because that is
+     * the only protocol the recorder offers.
+     */
+    private void interceptTls(Socket client, InputStream clientIn, Socket origin, String host, int port,
+            String hostPort) throws IOException {
+        SSLSocket browser;
+        Socket upstream;
+        try {
+            browser = tls.accept(client, clientIn, host);
+            upstream = openUpstream(origin, host, port, true);
+        } catch (Exception ex) {
+            seen("HTTPS " + hostPort + " failed: " + ex.getMessage());
+            return;
+        }
+        active.add(upstream);
+        try {
+            proxyTunnelledHttp(browser.getInputStream(), browser.getOutputStream(), upstream, hostPort, "https");
+        } finally {
+            active.remove(upstream);
+            upstream.close();
+        }
+    }
+
+    private Socket openUpstream(Socket tcp, String host, int port, boolean tlsRequired) throws IOException {
+        if (!tlsRequired) {
+            return tcp;
+        }
+        try {
+            if (trustAllOrigins) {
+                return tls.connect(tcp, host, port, true);
+            }
+            try {
+                return tls.connect(tcp, host, port, false);
+            } catch (Exception ex) {
+                try {
+                    tcp.close();
+                } catch (IOException ignored) {
+                    // The failed handshake already closed it.
+                }
+                Socket again = new Socket();
+                try {
+                    again.connect(new InetSocketAddress(host, port), 15_000);
+                    again.setTcpNoDelay(true);
+                    seen("HTTPS " + host + " is not in the Java trust store; recording it anyway");
+                    return tls.connect(again, host, port, true);
+                } catch (Exception againFailed) {
+                    try {
+                        again.close();
+                    } catch (IOException ignored) {
+                        // Already closed.
+                    }
+                    if (againFailed instanceof IOException io) {
+                        throw io;
+                    }
+                    throw new IOException("HTTPS to " + host + " failed: " + againFailed.getMessage(), againFailed);
+                }
+            }
+        } catch (IOException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            try {
+                tcp.close();
+            } catch (IOException ignored) {
+                // Already closed.
+            }
+            throw new IOException("HTTPS to " + host + " failed: " + ex.getMessage(), ex);
         }
     }
 
@@ -425,7 +535,7 @@ public final class RecordingProxy {
      * Blazor WebSocket arrives as a SOCKS connection. Without this handshake
      * the page renders and nothing in it works.
      */
-    private void socks5(InputStream clientIn, OutputStream clientOut) throws IOException {
+    private void socks5(Socket client, InputStream clientIn, OutputStream clientOut) throws IOException {
         int version = clientIn.read();
         int methods = clientIn.read();
         if (version != 0x05 || methods < 0) {
@@ -461,10 +571,10 @@ public final class RecordingProxy {
             clientOut.flush();
             return;
         }
-        openSocksTarget(clientIn, clientOut, host, port, socks5Reply(0x00), socks5Reply(0x05));
+        openSocksTarget(client, clientIn, clientOut, host, port, socks5Reply(0x00), socks5Reply(0x05));
     }
 
-    private void socks4(InputStream clientIn, OutputStream clientOut) throws IOException {
+    private void socks4(Socket client, InputStream clientIn, OutputStream clientOut) throws IOException {
         int version = clientIn.read();
         int command = clientIn.read();
         int port = readPort(clientIn);
@@ -491,11 +601,11 @@ public final class RecordingProxy {
         } else {
             host = (ip[0] & 0xff) + "." + (ip[1] & 0xff) + "." + (ip[2] & 0xff) + "." + (ip[3] & 0xff);
         }
-        openSocksTarget(clientIn, clientOut, host, port, new byte[] {0x00, 0x5A, 0, 0, 0, 0, 0, 0},
+        openSocksTarget(client, clientIn, clientOut, host, port, new byte[] {0x00, 0x5A, 0, 0, 0, 0, 0, 0},
                 new byte[] {0x00, 0x5B, 0, 0, 0, 0, 0, 0});
     }
 
-    private void openSocksTarget(InputStream clientIn, OutputStream clientOut, String host, int port,
+    private void openSocksTarget(Socket client, InputStream clientIn, OutputStream clientOut, String host, int port,
             byte[] granted, byte[] failed) throws IOException {
         Socket origin = new Socket();
         try {
@@ -520,8 +630,12 @@ public final class RecordingProxy {
                 String authority = host.contains(":") && !host.startsWith("[")
                         ? "[" + host + "]:" + port
                         : host + ":" + port;
+                if (first == 0x16) {
+                    interceptTls(client, push, origin, host, port, authority);
+                    return;
+                }
                 if (first >= 'A' && first <= 'Z') {
-                    proxyTunnelledHttp(push, clientOut, origin, authority);
+                    proxyTunnelledHttp(push, clientOut, origin, authority, "http");
                     return;
                 }
                 relay(push, clientOut, origin);
@@ -601,21 +715,22 @@ public final class RecordingProxy {
      * with CONNECT and only then send the upgrade. Browsers usually send the
      * upgrade as a proxied GET instead. Both have to be recorded.
      */
-    private void proxyTunnelledHttp(InputStream clientIn, OutputStream clientOut, Socket origin, String hostPort)
-            throws IOException {
+    private void proxyTunnelledHttp(InputStream clientIn, OutputStream clientOut, Socket origin, String hostPort,
+            String scheme) throws IOException {
         String requestLine = readLine(clientIn);
         synchronized (this) {
             seenRequests.add("TUNNEL " + requestLine);
+        }
+        if (requestLine.startsWith("PRI ")) {
+            seen("HTTP/2 " + hostPort + " was closed; the recorder speaks HTTP/1.1 inside HTTPS");
+            return;
         }
         List<String> headers = readHeaders(clientIn);
         String[] parts = requestLine.split(" ", 3);
         if (parts.length < 2) {
             return;
         }
-        String path = parts[1];
-        URI uri = path.startsWith("http://") || path.startsWith("https://")
-                ? URI.create(path)
-                : URI.create("http://" + hostPort + (path.startsWith("/") ? path : "/" + path));
+        URI uri = tunnelUri(parts[1], hostPort, scheme);
         byte[] body = readBody(clientIn, headers);
         writeOriginRequest(origin.getOutputStream(), parts[0], uri, headers, body);
         String status = readLine(origin.getInputStream());
@@ -628,7 +743,27 @@ public final class RecordingProxy {
             splice(clientIn, clientOut, origin.getInputStream(), origin.getOutputStream(), null, origin);
             return;
         }
-        copyBody(origin.getInputStream(), clientOut, responseHeaders);
+        byte[] responseBody = copyBody(origin.getInputStream(), clientOut, responseHeaders);
+        notePage(headers, uri, status, responseHeaders, responseBody);
+    }
+
+    private static URI tunnelUri(String path, String hostPort, String scheme) {
+        if (path.startsWith("http://") || path.startsWith("https://")) {
+            return URI.create(path);
+        }
+        String authority = hostPort;
+        if ("https".equals(scheme) && authority.endsWith(":443")) {
+            authority = authority.substring(0, authority.length() - 4);
+        } else if ("http".equals(scheme) && authority.endsWith(":80")) {
+            authority = authority.substring(0, authority.length() - 3);
+        }
+        return URI.create(scheme + "://" + authority + (path.startsWith("/") ? path : "/" + path));
+    }
+
+    private void seen(String line) {
+        synchronized (this) {
+            seenRequests.add(line);
+        }
     }
 
     private static void copyRaw(InputStream in, Socket destination) {

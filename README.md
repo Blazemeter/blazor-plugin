@@ -28,7 +28,7 @@ Restart JMeter.
 
 1. Open **File → Templates** and choose **bzm - Blazor Recorder**. The plan has a **Blazor Users** thread group, a View Results Tree inside it, and the recorder. Press **Start**. The default listen address is `127.0.0.1:8888`.
 2. Set the browser HTTP proxy to `127.0.0.1` port `8888`. Include the application host; do not bypass LAN addresses.
-3. Open the app over **http** and use it: follow links, click, type. Connect, Navigate, and Invoke samplers appear in the first thread group while you browse. A thread group named **Blazor Users** is created when the plan does not have one.
+3. Trust `~/.jmeter/blazor-recorder/ca.crt` in the browser. The path is shown on the recorder after Start. Then open the app over **http** or **https** and use it: follow links, click, type. Connect, Navigate, and Invoke samplers appear in the first thread group while you browse. A thread group named **Blazor Users** is created when the plan does not have one.
 4. Press **Stop** to close the circuit and add Disconnect. Firefox's `permessage-deflate` extension is removed so the circuit messages stay readable; the page still loads either way.
 
 Stop drops the circuit bookkeeping (handshake, `StartCircuit`, root-component batches, render acknowledgements, pings). What remains is the user-level script:
@@ -61,7 +61,7 @@ The sample response is a transcript: page fetches, hub calls sent, and the serve
 
 ## Limits
 
-- **HTTPS recording.** A TLS `CONNECT` tunnel is forwarded and not decoded, so an `https://` Blazor app is not recorded. Replay itself does speak `https` and `wss`.
+- **HTTPS.** The recorder decrypts the tunnel with its own certificate, so the browser has to trust `~/.jmeter/blazor-recorder/ca.crt` once. Inside that tunnel it speaks HTTP/1.1, which is how an HTTP/2 site is recorded. A server that refuses HTTP/1.1 does not produce samplers. Replay still speaks HTTP/2 to the real server when the server allows it.
 - **Browser return values.** Render batches are acknowledged. JavaScript calls are completed with a null result, which is enough for the Harbor pages. A call that needs a real DOM return value is not executed in a browser.
 - **Clicks.** A recorded `BeginInvokeDotNetFromJS` is replayed with the same arguments. That works when the new circuit assigns the same event ids. Navigation does not depend on those ids: Navigate rebuilds the root components from the live page.
 - **WebAssembly roots** are not attached. An `auto` root is attached as a server component.

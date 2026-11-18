@@ -29,23 +29,35 @@ import javax.swing.SwingUtilities;
 public final class RecordingGroupWindow {
 
     private final JDialog dialog;
+    private final Window screen;
     private final JTextField name = new JTextField("Blazor", 22);
     private final JTextArea comment = new JTextArea(3, 22);
     private final JLabel server = new JLabel("Server: waiting for the app");
     private final JLabel pending = new JLabel("Ungrouped samplers: 0");
     private final JLabel message = new JLabel(" ");
     private boolean placed;
+    private boolean closing;
 
-    public RecordingGroupWindow(JComponent owner, Runnable onGroup, Runnable onStop) {
-        Window parent = SwingUtilities.getWindowAncestor(owner);
-        dialog = new JDialog(parent, "Blazor recording");
+    public RecordingGroupWindow(JComponent anchor, Runnable onGroup, Runnable onStop) {
+        screen = SwingUtilities.getWindowAncestor(anchor);
+        // Unowned, so it is not ordered together with the JMeter frame.
+        // Typing requires this window to become active. That also raises
+        // JMeter, so the frame is sent behind the browser until Stop or close.
+        dialog = new JDialog((Window) null, "Blazor recording");
         dialog.setAlwaysOnTop(true);
+        dialog.setFocusableWindowState(true);
         dialog.setAutoRequestFocus(false);
+        dialog.getRootPane().putClientProperty("Window.hidesOnDeactivate", Boolean.FALSE);
         dialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
         dialog.addWindowListener(new WindowAdapter() {
             @Override
+            public void windowActivated(WindowEvent event) {
+                keepJMeterBehind();
+            }
+
+            @Override
             public void windowClosing(WindowEvent event) {
-                onStop.run();
+                finish(onStop);
             }
         });
 
@@ -75,7 +87,7 @@ public final class RecordingGroupWindow {
         JButton group = new JButton("Group into simple controller");
         group.addActionListener(event -> onGroup.run());
         JButton stop = new JButton("Stop recording");
-        stop.addActionListener(event -> onStop.run());
+        stop.addActionListener(event -> finish(onStop));
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
         actions.add(group);
         actions.add(stop);
@@ -130,18 +142,39 @@ public final class RecordingGroupWindow {
         message.setText(text == null || text.isBlank() ? " " : text);
     }
 
-    private void place() {
-        GraphicsConfiguration screen = null;
-        if (dialog.getOwner() != null) {
-            screen = dialog.getOwner().getGraphicsConfiguration();
+    private void finish(Runnable onStop) {
+        closing = true;
+        if (screen != null) {
+            screen.setVisible(true);
+            screen.toFront();
+            screen.requestFocus();
         }
-        if (screen == null) {
-            screen = dialog.getGraphicsConfiguration();
-        }
-        if (screen == null) {
+        onStop.run();
+    }
+
+    private void keepJMeterBehind() {
+        if (closing || screen == null) {
             return;
         }
-        Rectangle bounds = screen.getBounds();
+        SwingUtilities.invokeLater(() -> {
+            if (!closing && screen.isVisible()) {
+                screen.toBack();
+            }
+        });
+    }
+
+    private void place() {
+        GraphicsConfiguration configuration = null;
+        if (screen != null) {
+            configuration = screen.getGraphicsConfiguration();
+        }
+        if (configuration == null) {
+            configuration = dialog.getGraphicsConfiguration();
+        }
+        if (configuration == null) {
+            return;
+        }
+        Rectangle bounds = configuration.getBounds();
         int x = bounds.x + bounds.width - dialog.getWidth() - 24;
         int y = bounds.y + 48;
         dialog.setLocation(Math.max(bounds.x, x), y);

@@ -19,7 +19,7 @@ Java 17 and JMeter 5.6 or newer.
 
 ```bash
 mvn package
-cp target/jmeter-bzm-blazor-0.1.0.jar "$JMETER_HOME/lib/ext"
+cp target/jmeter-bzm-blazor-0.2.0.jar "$JMETER_HOME/lib/ext"
 ```
 
 Restart JMeter.

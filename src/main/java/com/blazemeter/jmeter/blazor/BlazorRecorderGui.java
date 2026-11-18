@@ -1,12 +1,17 @@
 package com.blazemeter.jmeter.blazor;
 
+import com.blazemeter.jmeter.blazor.recorder.RecordedServer;
 import com.blazemeter.jmeter.blazor.recorder.RecordedStep;
+import com.blazemeter.jmeter.blazor.recorder.RecordingGroupWindow;
 import com.blazemeter.jmeter.blazor.recorder.RecordingProxy;
 import java.awt.BorderLayout;
 import java.awt.FlowLayout;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import javax.swing.JButton;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
@@ -14,9 +19,16 @@ import javax.swing.JPopupMenu;
 import javax.swing.JScrollPane;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
+import javax.swing.JTree;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
+import javax.swing.tree.TreePath;
+import org.apache.jmeter.config.Argument;
+import org.apache.jmeter.config.Arguments;
+import org.apache.jmeter.config.gui.ArgumentsPanel;
+import org.apache.jmeter.control.GenericController;
 import org.apache.jmeter.control.LoopController;
+import org.apache.jmeter.control.gui.LogicControllerGui;
 import org.apache.jmeter.exceptions.IllegalUserActionException;
 import org.apache.jmeter.gui.AbstractJMeterGuiComponent;
 import org.apache.jmeter.gui.GuiPackage;
@@ -24,13 +36,21 @@ import org.apache.jmeter.gui.tree.JMeterTreeModel;
 import org.apache.jmeter.gui.tree.JMeterTreeNode;
 import org.apache.jmeter.gui.util.MenuFactory;
 import org.apache.jmeter.testelement.TestElement;
+import org.apache.jmeter.testelement.TestPlan;
+import org.apache.jmeter.testelement.property.CollectionProperty;
+import org.apache.jmeter.testelement.property.JMeterProperty;
 import org.apache.jmeter.threads.AbstractThreadGroup;
 import org.apache.jmeter.threads.ThreadGroup;
 import org.apache.jmeter.util.JMeterUtils;
 
 /**
  * Start a local proxy and insert Connect / Navigate / Invoke samplers into
- * the first thread group as the browser uses the Blazor app.
+ * the first thread group as the browser uses the Blazor app. The server
+ * origin is stored in a numbered User Defined Variable, {@code SERVER_1},
+ * {@code SERVER_2}, and so on. A small
+ * window stays above the other applications so the steps recorded since the
+ * last group can be wrapped in a Simple Controller. Stop and the window's
+ * close button both end the recording.
  */
 public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
 
@@ -41,9 +61,13 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
     private final JTextField port = new JTextField("8888", 6);
     private final JTextArea status = new JTextArea(12, 50);
     private final JButton start = new JButton("Start");
-    private final JButton stop = new JButton("Stop");
     private Timer refresher;
     private String serverUrl = "";
+    private String serverOrigin = "";
+    private String serverVariable = "";
+    private transient JMeterTreeNode variablesNode;
+    private transient RecordingGroupWindow groupWindow;
+    private transient List<JMeterTreeNode> recordedNodes = new ArrayList<>();
 
     public BlazorRecorderGui() {
         super();
@@ -59,17 +83,16 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
         controls.add(new JLabel("Listen port"));
         controls.add(port);
         controls.add(start);
-        controls.add(stop);
-        stop.setEnabled(false);
         add(controls, BorderLayout.CENTER);
 
         status.setEditable(false);
         status.setText("Point the browser HTTP and SOCKS proxy at 127.0.0.1 (or localhost) and this port.\n"
-                + "Samplers appear in the first thread group while you browse. HTTPS is tunneled and not recorded.");
+                + "Samplers appear in the first thread group while you browse. HTTPS is tunneled and not recorded.\n"
+                + "Each server is stored as ${SERVER_1}, ${SERVER_2}, and so on. A window stays on top so you can group steps.\n"
+                + "Stop, or close that window, to finish recording.");
         add(new JScrollPane(status), BorderLayout.SOUTH);
 
         start.addActionListener(event -> startRecording());
-        stop.addActionListener(event -> stopRecording());
     }
 
     private void startRecording() {
@@ -84,18 +107,42 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
             JMeterUtils.reportErrorToUser("Port must be a number", "Blazor Recorder");
             return;
         }
+        try {
+            ensureVariables();
+        } catch (Exception ex) {
+            JMeterUtils.reportErrorToUser(ex.getMessage(), "Blazor Recorder");
+            return;
+        }
         serverUrl = "";
+        serverOrigin = "";
+        serverVariable = "";
+        if (recordedNodes == null) {
+            recordedNodes = new ArrayList<>();
+        }
+        recordedNodes.clear();
+        if (groupWindow != null) {
+            groupWindow.dispose();
+        }
+        groupWindow = new RecordingGroupWindow(this, this::groupSamplers, this::stopRecording);
         RecordingProxy proxy = new RecordingProxy();
-        proxy.setStepListener(step -> SwingUtilities.invokeLater(() -> acceptStep(step)));
+        proxy.setStepListener(step -> {
+            if (SwingUtilities.isEventDispatchThread()) {
+                acceptStep(step);
+            } else {
+                SwingUtilities.invokeLater(() -> acceptStep(step));
+            }
+        });
         try {
             proxy.start(listen);
         } catch (Exception ex) {
+            groupWindow.dispose();
+            groupWindow = null;
             JMeterUtils.reportErrorToUser(ex.getMessage(), "Blazor Recorder");
             return;
         }
         running = proxy;
         start.setEnabled(false);
-        stop.setEnabled(true);
+        groupWindow.show();
         refresher = new Timer(400, event -> refreshStatus());
         refresher.start();
         refreshStatus();
@@ -103,11 +150,18 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
 
     private void acceptStep(RecordedStep step) {
         try {
+            if (step.kind() == RecordedStep.Kind.CONNECT) {
+                String origin = RecordedServer.origin(step.value());
+                if (!origin.isEmpty()) {
+                    storeServer(origin);
+                }
+            }
             insert(List.of(step));
         } catch (Exception ex) {
             status.append("\nCould not insert " + step.label() + ": " + ex.getMessage());
             JMeterUtils.reportErrorToUser(ex.getMessage(), "Blazor Recorder");
         }
+        touchGroupWindow();
     }
 
     private void refreshStatus() {
@@ -117,7 +171,13 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
         }
         StringBuilder report = new StringBuilder();
         report.append("Recording on 127.0.0.1:").append(proxy.port()).append('\n');
-        report.append("Samplers are added to the first thread group as you use the app.\n");
+        if (serverOrigin.isEmpty()) {
+            report.append("The server variable is empty until the app opens a circuit.\n");
+        } else {
+            report.append("${").append(serverVariable).append("} = ").append(serverOrigin).append('\n');
+        }
+        report.append("Samplers are added to the first thread group. ")
+                .append("Group them from the window, or close it to stop.\n");
         List<String> seen = proxy.seenRequests();
         report.append("Browser requests seen: ").append(seen.size()).append('\n');
         int from = Math.max(0, seen.size() - 8);
@@ -132,19 +192,26 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
             report.append("• ").append(step.label()).append('\n');
         }
         status.setText(report.toString());
+        touchGroupWindow();
     }
 
     private void stopRecording() {
+        RecordingProxy proxy = running;
+        RecordingGroupWindow window = groupWindow;
+        if (proxy == null && window == null) {
+            return;
+        }
         if (refresher != null) {
             refresher.stop();
             refresher = null;
         }
-        RecordingProxy proxy = running;
         running = null;
+        groupWindow = null;
         start.setEnabled(true);
-        stop.setEnabled(false);
+        if (window != null) {
+            SwingUtilities.invokeLater(window::dispose);
+        }
         if (proxy == null) {
-            status.setText("Recorder was not running.");
             return;
         }
         proxy.stop();
@@ -152,6 +219,9 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
         List<RecordedStep> steps = proxy.steps();
         StringBuilder report = new StringBuilder();
         report.append("Recorded ").append(steps.size()).append(" steps.\n");
+        if (!serverOrigin.isEmpty()) {
+            report.append("${").append(serverVariable).append("} = ").append(serverOrigin).append('\n');
+        }
         for (RecordedStep step : steps) {
             report.append(step.label());
             if (!step.arguments().isEmpty()) {
@@ -163,6 +233,203 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
         status.setText(report.toString());
     }
 
+    private void touchGroupWindow() {
+        if (groupWindow == null) {
+            return;
+        }
+        groupWindow.setServer(serverVariable, serverOrigin);
+        groupWindow.setUngrouped(ungroupedSamplers().size());
+    }
+
+    private void groupSamplers() {
+        if (groupWindow == null) {
+            return;
+        }
+        List<JMeterTreeNode> pending = ungroupedSamplers();
+        if (pending.isEmpty()) {
+            groupWindow.setMessage("No samplers to group yet.");
+            return;
+        }
+        String controllerName = groupWindow.groupName();
+        String controllerComment = groupWindow.groupComment();
+        try {
+            GuiPackage gui = GuiPackage.getInstance();
+            if (gui == null) {
+                groupWindow.setMessage("JMeter GUI is not available.");
+                return;
+            }
+            JMeterTreeNode parent = (JMeterTreeNode) pending.get(0).getParent();
+            JMeterTreeModel model = gui.getTreeModel();
+            int index = parent.getIndex(pending.get(0));
+            GenericController controller = new GenericController();
+            controller.setName(controllerName);
+            controller.setComment(controllerComment);
+            controller.setProperty(TestElement.GUI_CLASS, LogicControllerGui.class.getName());
+            controller.setProperty(TestElement.TEST_CLASS, GenericController.class.getName());
+            JMeterTreeNode controllerNode = model.addComponent(controller, parent);
+            model.removeNodeFromParent(controllerNode);
+            for (int i = pending.size() - 1; i >= 0; i--) {
+                model.removeNodeFromParent(pending.get(i));
+            }
+            model.insertNodeInto(controllerNode, parent, Math.min(index, parent.getChildCount()));
+            for (JMeterTreeNode sampler : pending) {
+                model.insertNodeInto(sampler, controllerNode, controllerNode.getChildCount());
+            }
+            reveal(controllerNode);
+            gui.setDirty(true);
+            groupWindow.setMessage("Grouped " + pending.size() + " samplers into \"" + controllerName + "\".");
+            touchGroupWindow();
+        } catch (Exception ex) {
+            groupWindow.setMessage(ex.getMessage() == null ? "Could not group samplers." : ex.getMessage());
+            JMeterUtils.reportErrorToUser(ex.getMessage(), "Blazor Recorder");
+        }
+    }
+
+    private List<JMeterTreeNode> ungroupedSamplers() {
+        if (recordedNodes == null) {
+            recordedNodes = new ArrayList<>();
+        }
+        recordedNodes.removeIf(node -> node.getParent() == null);
+        JMeterTreeNode parent = null;
+        List<JMeterTreeNode> pending = new ArrayList<>();
+        for (JMeterTreeNode node : recordedNodes) {
+            if (!(node.getParent() instanceof JMeterTreeNode candidate)) {
+                continue;
+            }
+            if (!(candidate.getTestElement() instanceof AbstractThreadGroup)) {
+                continue;
+            }
+            if (!(node.getTestElement() instanceof BlazorSampler)) {
+                continue;
+            }
+            if (parent == null) {
+                parent = candidate;
+            }
+            if (candidate == parent) {
+                pending.add(node);
+            }
+        }
+        return pending;
+    }
+
+    private static void reveal(JMeterTreeNode node) {
+        GuiPackage gui = GuiPackage.getInstance();
+        if (gui == null || gui.getMainFrame() == null) {
+            return;
+        }
+        JTree tree = gui.getMainFrame().getTree();
+        tree.expandPath(new TreePath(node.getPath()));
+    }
+
+    private void ensureVariables() throws IllegalUserActionException {
+        GuiPackage gui = GuiPackage.getInstance();
+        if (gui == null) {
+            throw new IllegalStateException("JMeter GUI is not available");
+        }
+        if (variablesNode != null && variablesNode.getParent() != null
+                && variablesNode.getTestElement() instanceof Arguments) {
+            return;
+        }
+        JMeterTreeModel model = gui.getTreeModel();
+        JMeterTreeNode root = (JMeterTreeNode) model.getRoot();
+        variablesNode = findServerVariables(root);
+        if (variablesNode != null) {
+            return;
+        }
+        JMeterTreeNode plan = findTestPlan(root);
+        if (plan == null) {
+            throw new IllegalStateException("Could not find the test plan");
+        }
+        Arguments arguments = new Arguments();
+        arguments.setName("User Defined Variables");
+        arguments.setComment("Blazor recorder. Each origin is ${SERVER_1}, ${SERVER_2}, and so on.");
+        arguments.setProperty(TestElement.GUI_CLASS, ArgumentsPanel.class.getName());
+        arguments.setProperty(TestElement.TEST_CLASS, Arguments.class.getName());
+        variablesNode = model.addComponent(arguments, plan);
+        gui.setDirty(true);
+    }
+
+    private void storeServer(String origin) throws IllegalUserActionException {
+        ensureVariables();
+        if (!(variablesNode.getTestElement() instanceof Arguments arguments)) {
+            throw new IllegalStateException("User Defined Variables element is missing");
+        }
+        String variable = RecordedServer.variableFor(serverVariables(arguments), origin);
+        setArgument(arguments, variable, origin);
+        serverVariable = variable;
+        serverOrigin = origin;
+        GuiPackage gui = GuiPackage.getInstance();
+        gui.setDirty(true);
+        if (gui.getCurrentNode() == variablesNode) {
+            gui.refreshCurrentGui();
+        }
+    }
+
+    private static Map<String, String> serverVariables(Arguments arguments) {
+        Map<String, String> defined = new LinkedHashMap<>();
+        CollectionProperty items = arguments.getArguments();
+        if (items == null) {
+            return defined;
+        }
+        for (int i = 0; i < items.size(); i++) {
+            JMeterProperty property = items.get(i);
+            if (!(property.getObjectValue() instanceof Argument argument)) {
+                continue;
+            }
+            if (RecordedServer.VARIABLE.equals(argument.getName()) || RecordedServer.index(argument.getName()) > 0) {
+                defined.put(argument.getName(), argument.getValue());
+            }
+        }
+        return defined;
+    }
+
+    private static void setArgument(Arguments arguments, String name, String value) {
+        CollectionProperty items = arguments.getArguments();
+        if (items != null) {
+            for (int i = 0; i < items.size(); i++) {
+                JMeterProperty property = items.get(i);
+                if (property.getObjectValue() instanceof Argument argument && name.equals(argument.getName())) {
+                    argument.setValue(value);
+                    return;
+                }
+            }
+        }
+        arguments.addArgument(name, value, "=");
+    }
+
+    private static JMeterTreeNode findServerVariables(JMeterTreeNode node) {
+        if (node.getTestElement() instanceof Arguments arguments && arguments.getClass() == Arguments.class
+                && arguments.getArguments() != null
+                && hasServerVariable(arguments)) {
+            return node;
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            JMeterTreeNode found = findServerVariables((JMeterTreeNode) node.getChildAt(i));
+            if (found != null) {
+                return found;
+            }
+        }
+        return null;
+    }
+
+    private static boolean hasServerVariable(Arguments arguments) {
+        return !serverVariables(arguments).isEmpty();
+    }
+
+    /**
+     * The model root is hidden and shares its test element with the visible
+     * test plan, so the plan to attach elements to is the visible child.
+     */
+    private static JMeterTreeNode findTestPlan(JMeterTreeNode root) {
+        for (int i = 0; i < root.getChildCount(); i++) {
+            JMeterTreeNode child = (JMeterTreeNode) root.getChildAt(i);
+            if (child.getTestElement() instanceof TestPlan) {
+                return child;
+            }
+        }
+        return null;
+    }
+
     private int insert(List<RecordedStep> steps) throws IllegalUserActionException {
         GuiPackage gui = GuiPackage.getInstance();
         if (gui == null) {
@@ -172,6 +439,10 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
         JMeterTreeNode root = (JMeterTreeNode) model.getRoot();
         JMeterTreeNode threadGroup = findThreadGroup(root);
         if (threadGroup == null) {
+            JMeterTreeNode plan = findTestPlan(root);
+            if (plan == null) {
+                throw new IllegalStateException("Could not find the test plan");
+            }
             ThreadGroup group = new ThreadGroup();
             group.setName("Blazor Users");
             group.setNumThreads(1);
@@ -181,8 +452,8 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
             loop.setContinueForever(false);
             loop.initialize();
             group.setSamplerController(loop);
-            model.addComponent(group, root);
-            threadGroup = findNode(root, group);
+            model.addComponent(group, plan);
+            threadGroup = findNode(plan, group);
         }
         if (threadGroup == null) {
             throw new IllegalStateException("Could not find a thread group to hold the recording");
@@ -198,24 +469,35 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
             if (step.kind() == RecordedStep.Kind.CONNECT) {
                 serverUrl = step.value();
                 sampler.setAction(BlazorSampler.CONNECT);
-                sampler.setServerUrl(serverUrl);
+                sampler.setServerUrl(serverField(serverUrl));
             } else if (step.kind() == RecordedStep.Kind.NAVIGATE) {
                 sampler.setAction(BlazorSampler.NAVIGATE);
-                sampler.setServerUrl(serverUrl);
-                sampler.setLocation(step.value());
+                sampler.setServerUrl(serverField(serverUrl));
+                sampler.setLocation(RecordedServer.reference(step.value(), serverOrigin, serverVariable));
             } else if (step.kind() == RecordedStep.Kind.INVOKE) {
                 sampler.setAction(BlazorSampler.INVOKE);
-                sampler.setServerUrl(serverUrl);
+                sampler.setServerUrl(serverField(serverUrl));
                 sampler.setTarget(step.value());
                 sampler.setArguments(step.arguments());
             } else {
                 sampler.setAction(BlazorSampler.DISCONNECT);
-                sampler.setServerUrl(serverUrl);
+                sampler.setServerUrl(serverField(serverUrl));
             }
-            model.addComponent(sampler, threadGroup);
+            if (recordedNodes == null) {
+                recordedNodes = new ArrayList<>();
+            }
+            recordedNodes.add(model.addComponent(sampler, threadGroup));
             count++;
         }
+        gui.setDirty(true);
         return count;
+    }
+
+    private String serverField(String url) {
+        if (serverOrigin.isEmpty() || serverVariable.isEmpty()) {
+            return url == null ? "" : url;
+        }
+        return RecordedServer.reference(url, serverOrigin, serverVariable);
     }
 
     private static JMeterTreeNode findThreadGroup(JMeterTreeNode node) {

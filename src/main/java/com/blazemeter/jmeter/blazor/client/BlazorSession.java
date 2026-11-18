@@ -18,6 +18,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -27,18 +28,28 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.zip.GZIPInputStream;
+import org.eclipse.jetty.client.BytesRequestContent;
 import org.eclipse.jetty.client.CompletableResponseListener;
 import org.eclipse.jetty.client.ContentResponse;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.HttpProxy;
-import org.eclipse.jetty.client.BytesRequestContent;
+import org.eclipse.jetty.client.Origin;
 import org.eclipse.jetty.client.Request;
+import org.eclipse.jetty.client.transport.HttpClientConnectionFactory;
+import org.eclipse.jetty.client.transport.HttpClientTransportDynamic;
+import org.eclipse.jetty.client.transport.HttpRequest;
 import org.eclipse.jetty.http.HttpCookieStore;
 import org.eclipse.jetty.http.HttpField;
 import org.eclipse.jetty.http.HttpFields;
 import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpMethod;
+import org.eclipse.jetty.http.HttpScheme;
+import org.eclipse.jetty.http.HttpVersion;
+import org.eclipse.jetty.http2.client.HTTP2Client;
+import org.eclipse.jetty.http2.client.transport.ClientConnectionFactoryOverHTTP2;
+import org.eclipse.jetty.io.ClientConnector;
 import org.eclipse.jetty.websocket.api.Callback;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 import org.eclipse.jetty.websocket.api.Session;
@@ -55,19 +66,26 @@ import org.slf4j.LoggerFactory;
  * in the HTML. Later navigations send {@code OnLocationChanged} and a fresh
  * root-component batch parsed from the enhanced-navigation response.
  * Render batches and JS calls are acknowledged so the circuit stays open.
- * HTTP and the WebSocket are Jetty 12. One shared client serves every direct
+ * HTTP and the WebSocket are Jetty 12. HTTP/2 is offered first. TLS
+ * negotiates with ALPN and falls back to HTTP/1.1, including the socket
+ * when the server does not allow a WebSocket on HTTP/2. Clear-text has no
+ * ALPN, so a failed HTTP/2 attempt is retried once as HTTP/1.1 and that
+ * authority stays on HTTP/1.1. One shared client serves every direct
  * circuit; a session opened through a proxy gets its own client so other
  * threads are not sent through that proxy. Cookies stay on the session, so
  * virtual users do not share a jar.
  */
 public final class BlazorSession {
 
-    static final String USER_AGENT = "bzm-blazor-plugin/0.1";
+    static final String USER_AGENT = "bzm-blazor-plugin/0.2.0";
     private static final long SETTLE_MS = 600;
     private static final int MAX_BODY = 16 * 1024 * 1024;
     private static final Logger LOG = LoggerFactory.getLogger(BlazorSession.class);
     private static final Object CLIENTS = new Object();
     private static volatile JettyStack sharedStack;
+    /** Authorities whose clear-text HTTP/2 attempt failed. */
+    private static final ConcurrentHashMap<String, Boolean> HTTP1_ONLY = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, String> SPOKEN = new ConcurrentHashMap<>();
 
     private final int timeoutMs;
     private final InetSocketAddress proxy;
@@ -105,7 +123,8 @@ public final class BlazorSession {
             PageDocument document = PageDocument.parse(home.finalUri, home.body);
             baseUri = document.baseUri();
             pageUri = document.location();
-            log("GET " + home.finalUri + " -> " + home.status + ", server roots " + document.serverMarkers().size());
+            log("GET " + home.finalUri + " -> " + home.status + " " + home.version
+                    + ", server roots " + document.serverMarkers().size());
             try {
                 get(URI.create(baseUri).resolve("_blazor/initializers"), null);
             } catch (Exception ex) {
@@ -146,7 +165,8 @@ public final class BlazorSession {
             requireHttp(page, "navigation");
             PageDocument document = PageDocument.parse(page.finalUri, unframe(page));
             pageUri = document.location();
-            log("GET " + page.finalUri + " -> " + page.status + ", server roots " + document.serverMarkers().size());
+            log("GET " + page.finalUri + " -> " + page.status + " " + page.version
+                    + ", server roots " + document.serverMarkers().size());
             publishRoots(document.serverMarkers(), document.applicationState());
             return callText();
         } catch (BlazorException ex) {
@@ -257,14 +277,30 @@ public final class BlazorSession {
         String scheme = "https".equalsIgnoreCase(http.getScheme()) ? "wss" : "ws";
         URI webSocketUri = new URI(scheme, http.getRawUserInfo(), http.getHost(), http.getPort(),
                 http.getRawPath(), http.getRawQuery(), null);
-        log("WebSocket " + webSocketUri);
+        boolean http1 = http1Only(webSocketUri);
+        log("WebSocket " + webSocketUri + " " + (http1 ? HttpVersion.HTTP_1_1 : HttpVersion.HTTP_2));
+        try {
+            this.webSocket = openSocket(webSocketUri, http1);
+        } catch (Exception ex) {
+            if (http1 || HttpScheme.isSecure(webSocketUri.getScheme()) || interrupted(ex)) {
+                throw ex;
+            }
+            noteHttp1Fallback(webSocketUri, ex);
+            this.webSocket = openSocket(webSocketUri, true);
+        }
+    }
+
+    private Session openSocket(URI webSocketUri, boolean http1) throws Exception {
         ClientUpgradeRequest upgrade = new ClientUpgradeRequest(webSocketUri);
         upgrade.setHeader("User-Agent", USER_AGENT);
+        if (http1) {
+            upgrade.setHttpVersion(HttpVersion.HTTP_1_1.asString());
+        }
         String cookie = cookieHeader();
         if (!cookie.isEmpty()) {
             upgrade.setHeader("Cookie", cookie);
         }
-        this.webSocket = transport.sockets.connect(new CircuitEndpoint(incoming), upgrade)
+        return transport.sockets.connect(new CircuitEndpoint(incoming), upgrade)
                 .get(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
@@ -425,18 +461,33 @@ public final class BlazorSession {
     }
 
     private HttpResult get(URI uri, String accept) throws Exception {
-        Request request = request(uri).method(HttpMethod.GET);
-        if (accept != null) {
-            request.headers(headers -> headers.put(HttpHeader.ACCEPT, accept));
-        }
-        return exchange(request);
+        return exchange(() -> {
+            Request request = request(uri).method(HttpMethod.GET);
+            if (accept != null) {
+                request.headers(headers -> headers.put(HttpHeader.ACCEPT, accept));
+            }
+            return request;
+        });
     }
 
     private HttpResult post(URI uri) throws Exception {
-        return exchange(request(uri).method(HttpMethod.POST).body(new BytesRequestContent(new byte[0])));
+        return exchange(() -> request(uri).method(HttpMethod.POST).body(new BytesRequestContent(new byte[0])));
     }
 
-    private HttpResult exchange(Request request) throws Exception {
+    private HttpResult exchange(Supplier<Request> requests) throws Exception {
+        Request request = requests.get();
+        try {
+            return send(request);
+        } catch (Exception ex) {
+            if (!canFallback(request, ex)) {
+                throw ex;
+            }
+            noteHttp1Fallback(request.getURI(), ex);
+            return send(requests.get().version(HttpVersion.HTTP_1_1));
+        }
+    }
+
+    private HttpResult send(Request request) throws Exception {
         AtomicReference<URI> landed = new AtomicReference<>(request.getURI());
         request.onResponseBegin(response -> landed.set(response.getRequest().getURI()));
         ContentResponse response = new CompletableResponseListener(request, MAX_BODY).send()
@@ -447,8 +498,59 @@ public final class BlazorSession {
         if (header(response.getHeaders(), HttpHeader.CONTENT_ENCODING).toLowerCase(Locale.ROOT).contains("gzip")) {
             content = gunzip(content);
         }
+        String version = response.getVersion() == null ? "" : response.getVersion().asString();
+        if (SPOKEN.putIfAbsent(authority(finalUri), version) == null) {
+            LOG.info("{} responded {}", authority(finalUri), version);
+        }
         return new HttpResult(response.getStatus(), finalUri, new String(content, StandardCharsets.UTF_8),
-                header(response.getHeaders(), "ssr-framing"));
+                header(response.getHeaders(), "ssr-framing"), version);
+    }
+
+    private void noteHttp1Fallback(URI uri, Exception failure) {
+        HTTP1_ONLY.put(authority(uri), Boolean.TRUE);
+        String line = "HTTP/2 failed for " + uri + " (" + rootMessage(failure) + "); retrying HTTP/1.1";
+        log(line);
+        LOG.info(line);
+    }
+
+    private static boolean canFallback(Request request, Exception failure) {
+        if (HttpScheme.isSecure(request.getScheme()) || interrupted(failure)) {
+            return false;
+        }
+        return !(request instanceof HttpRequest http)
+                || !http.isVersionExplicit()
+                || http.getVersion() != HttpVersion.HTTP_1_1;
+    }
+
+    private static boolean interrupted(Throwable failure) {
+        for (Throwable cursor = failure; cursor != null; cursor = cursor.getCause()) {
+            if (cursor instanceof InterruptedException) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String rootMessage(Throwable failure) {
+        Throwable cursor = failure;
+        while (cursor.getCause() != null && cursor.getCause() != cursor) {
+            cursor = cursor.getCause();
+        }
+        String message = cursor.getMessage();
+        return message == null || message.isBlank() ? cursor.getClass().getSimpleName() : message;
+    }
+
+    static boolean http1Only(URI uri) {
+        return HTTP1_ONLY.containsKey(authority(uri));
+    }
+
+    private static String authority(URI uri) {
+        int port = uri.getPort();
+        if (port < 0) {
+            String scheme = uri.getScheme() == null ? "" : uri.getScheme();
+            port = "https".equalsIgnoreCase(scheme) || "wss".equalsIgnoreCase(scheme) ? 443 : 80;
+        }
+        return uri.getHost() + ":" + port;
     }
 
     private Request request(URI uri) {
@@ -698,6 +800,17 @@ public final class BlazorSession {
         }
     }
 
+    /** The origin Jetty selects for this URI. Visible to tests. */
+    static Origin originFor(String uri) throws Exception {
+        HttpClient http = JettyStack.newHttpClient();
+        http.start();
+        try {
+            return http.getHttpClientTransport().newOrigin(http.newRequest(uri));
+        } finally {
+            http.stop();
+        }
+    }
+
     private static final class JettyStack {
         private final HttpClient http;
         private final WebSocketClient sockets;
@@ -735,7 +848,32 @@ public final class BlazorSession {
             QueuedThreadPool executor = new QueuedThreadPool();
             executor.setName("blazor-jetty");
             executor.setDaemon(true);
-            HttpClient http = new HttpClient();
+            ClientConnector connector = new ClientConnector();
+            HTTP2Client http2 = new HTTP2Client(connector);
+            http2.setIdleTimeout(120_000);
+            http2.setStreamIdleTimeout(120_000);
+            http2.setConnectTimeout(10_000);
+            // HTTP/2 first, then HTTP/1.1. On TLS, ALPN offers both and the
+            // server picks. A WebSocket on an HTTP/2 session that did not
+            // enable extended CONNECT is retried by Jetty on HTTP/1.1.
+            // Clear-text cannot negotiate, so the first attempt is h2c.
+            // After that attempt fails, later requests to the authority are
+            // pinned to HTTP/1.1.
+            HttpClientTransportDynamic transport = new HttpClientTransportDynamic(connector,
+                    new ClientConnectionFactoryOverHTTP2.HTTP2(http2),
+                    HttpClientConnectionFactory.HTTP11) {
+                @Override
+                public Origin newOrigin(Request request) {
+                    if (!HttpScheme.isSecure(request.getScheme())
+                            && request instanceof HttpRequest http
+                            && !http.isVersionExplicit()
+                            && http1Only(request.getURI())) {
+                        request.version(HttpVersion.HTTP_1_1);
+                    }
+                    return super.newOrigin(request);
+                }
+            };
+            HttpClient http = new HttpClient(transport);
             http.setName("blazor-http");
             http.setExecutor(executor);
             http.setConnectTimeout(10_000);
@@ -800,12 +938,14 @@ public final class BlazorSession {
         private final URI finalUri;
         private final String body;
         private final String framing;
+        private final String version;
 
-        private HttpResult(int status, URI finalUri, String body, String framing) {
+        private HttpResult(int status, URI finalUri, String body, String framing, String version) {
             this.status = status;
             this.finalUri = finalUri;
             this.body = body;
             this.framing = framing == null ? "" : framing;
+            this.version = version == null ? "" : version;
         }
     }
 

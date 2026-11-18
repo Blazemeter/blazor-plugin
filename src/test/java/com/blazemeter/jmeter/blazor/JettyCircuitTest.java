@@ -37,7 +37,10 @@ class JettyCircuitTest {
             BlazorSession session = new BlazorSession(8_000);
             try {
                 String opened = session.open(origin.url("/start"));
-                assertTrue(opened.contains("GET " + origin.url("/home")), opened);
+                assertTrue(opened.contains("retrying HTTP/1.1"), opened);
+                assertTrue(opened.contains("GET " + origin.url("/home") + " -> 200 HTTP/1.1"), opened);
+                assertTrue(opened.lines().anyMatch(line -> line.startsWith("WebSocket ") && line.endsWith("HTTP/1.1")),
+                        opened);
                 assertTrue(opened.contains("StartCircuit completed"), opened);
                 assertFalse(opened.contains("JS.Error"), opened);
                 String moved = session.navigate("/market");

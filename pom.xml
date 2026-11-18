@@ -6,7 +6,7 @@
 
     <groupId>com.blazemeter</groupId>
     <artifactId>jmeter-bzm-blazor</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
     <name>BlazeMeter Blazor Plugin for JMeter</name>
     <description>Record and replay Blazor Server circuits (SignalR blazorpack) from JMeter.</description>
     <url>https://github.com/Blazemeter</url>
@@ -36,6 +36,11 @@
         <dependency>
             <groupId>org.eclipse.jetty.websocket</groupId>
             <artifactId>jetty-websocket-jetty-client</artifactId>
+            <version>${jetty.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.jetty.http2</groupId>
+            <artifactId>jetty-http2-client-transport</artifactId>
             <version>${jetty.version}</version>
         </dependency>
         <dependency>

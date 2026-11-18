@@ -3,8 +3,8 @@ package com.blazemeter.jmeter.blazor;
 import org.apache.jmeter.testelement.AbstractTestElement;
 
 /**
- * Placeholder element for {@link BlazorRecorderGui}. The proxy lives on the
- * GUI because it is not part of a running test and must not be saved in the jmx.
+ * Element for {@link BlazorRecorderGui}. The running proxy is not part of a
+ * test; the element stores the listen port and is what the recorder template adds.
  */
 public class BlazorRecorder extends AbstractTestElement {
 

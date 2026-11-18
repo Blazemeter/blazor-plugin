@@ -2,6 +2,7 @@ package com.blazemeter.jmeter.blazor;
 
 import com.blazemeter.jmeter.blazor.recorder.RecordedServer;
 import com.blazemeter.jmeter.blazor.recorder.RecordedStep;
+import com.blazemeter.jmeter.blazor.recorder.RecorderTemplate;
 import com.blazemeter.jmeter.blazor.recorder.RecordingGroupWindow;
 import com.blazemeter.jmeter.blazor.recorder.RecordingProxy;
 import java.awt.BorderLayout;
@@ -55,6 +56,10 @@ import org.apache.jmeter.util.JMeterUtils;
 public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
 
     private static final long serialVersionUID = 1L;
+
+    static {
+        RecorderTemplate.install();
+    }
 
     private static RecordingProxy running;
 
@@ -326,19 +331,19 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
         if (gui == null) {
             throw new IllegalStateException("JMeter GUI is not available");
         }
-        if (variablesNode != null && variablesNode.getParent() != null
-                && variablesNode.getTestElement() instanceof Arguments) {
-            return;
-        }
         JMeterTreeModel model = gui.getTreeModel();
         JMeterTreeNode root = (JMeterTreeNode) model.getRoot();
-        variablesNode = findServerVariables(root);
-        if (variablesNode != null) {
-            return;
-        }
         JMeterTreeNode plan = findTestPlan(root);
         if (plan == null) {
             throw new IllegalStateException("Could not find the test plan");
+        }
+        if (variablesNode != null && inTree(variablesNode, plan)
+                && variablesNode.getTestElement() instanceof Arguments) {
+            return;
+        }
+        variablesNode = findServerVariables(plan);
+        if (variablesNode != null) {
+            return;
         }
         Arguments arguments = new Arguments();
         arguments.setName("User Defined Variables");
@@ -346,10 +351,32 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
         arguments.setProperty(TestElement.GUI_CLASS, ArgumentsPanel.class.getName());
         arguments.setProperty(TestElement.TEST_CLASS, Arguments.class.getName());
         variablesNode = model.addComponent(arguments, plan);
+        if (plan.getIndex(variablesNode) != 0) {
+            model.removeNodeFromParent(variablesNode);
+            model.insertNodeInto(variablesNode, plan, 0);
+        }
+        reveal(plan);
         gui.setDirty(true);
     }
 
+    /** True when {@code node} is {@code plan} or still sits under it. A node left over from a closed plan does not count. */
+    private static boolean inTree(JMeterTreeNode node, JMeterTreeNode plan) {
+        for (javax.swing.tree.TreeNode cursor = node; cursor != null; cursor = cursor.getParent()) {
+            if (cursor == plan) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void storeServer(String origin) throws IllegalUserActionException {
+        GuiPackage gui = GuiPackage.getInstance();
+        if (gui == null) {
+            throw new IllegalStateException("JMeter GUI is not available");
+        }
+        // Save the open screen first. Otherwise a later save of that screen can
+        // replace the argument we are about to add with the table's old rows.
+        gui.updateCurrentNode();
         ensureVariables();
         if (!(variablesNode.getTestElement() instanceof Arguments arguments)) {
             throw new IllegalStateException("User Defined Variables element is missing");
@@ -358,11 +385,11 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
         setArgument(arguments, variable, origin);
         serverVariable = variable;
         serverOrigin = origin;
-        GuiPackage gui = GuiPackage.getInstance();
         gui.setDirty(true);
         if (gui.getCurrentNode() == variablesNode) {
             gui.refreshCurrentGui();
         }
+        reveal(variablesNode);
     }
 
     private static Map<String, String> serverVariables(Arguments arguments) {
@@ -400,7 +427,7 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
     private static JMeterTreeNode findServerVariables(JMeterTreeNode node) {
         if (node.getTestElement() instanceof Arguments arguments && arguments.getClass() == Arguments.class
                 && arguments.getArguments() != null
-                && hasServerVariable(arguments)) {
+                && "User Defined Variables".equals(node.getName())) {
             return node;
         }
         for (int i = 0; i < node.getChildCount(); i++) {
@@ -410,10 +437,6 @@ public class BlazorRecorderGui extends AbstractJMeterGuiComponent {
             }
         }
         return null;
-    }
-
-    private static boolean hasServerVariable(Arguments arguments) {
-        return !serverVariables(arguments).isEmpty();
     }
 
     /**

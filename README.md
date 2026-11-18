@@ -26,7 +26,7 @@ Restart JMeter.
 
 ## Record
 
-1. Add **bzm - Blazor Recorder** under the test plan and press **Start**. The default listen address is `127.0.0.1:8888`.
+1. Open **File → Templates** and choose **bzm - Blazor Recorder**. The plan has a **Blazor Users** thread group, a View Results Tree inside it, and the recorder. Press **Start**. The default listen address is `127.0.0.1:8888`.
 2. Set the browser HTTP proxy to `127.0.0.1` port `8888`. Include the application host; do not bypass LAN addresses.
 3. Open the app over **http** and use it: follow links, click, type. Connect, Navigate, and Invoke samplers appear in the first thread group while you browse. A thread group named **Blazor Users** is created when the plan does not have one.
 4. Press **Stop** to close the circuit and add Disconnect. Firefox's `permessage-deflate` extension is removed so the circuit messages stay readable; the page still loads either way.

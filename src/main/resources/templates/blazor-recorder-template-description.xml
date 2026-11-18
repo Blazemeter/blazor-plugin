@@ -1,0 +1,12 @@
+<template isTestPlan="true">
+    <name>bzm - Blazor Recorder</name>
+    <fileName>/bin/templates/blazor-recorder.jmx</fileName>
+    <description><![CDATA[
+        <h1>Record a Blazor Server circuit</h1>
+        <h2>JMeter configuration</h2>
+        <p>The plan has a thread group, a View Results Tree inside it, and the Blazor recorder. The recorder listens on port 8888.</p>
+        <h2>Browser configuration</h2>
+        <p>Point the browser HTTP and SOCKS proxy at the machine running JMeter, port 8888. Do not bypass the application host. Open the app over http.</p>
+        <p>A window stays on top while you record. Group the steps into a Simple Controller from that window. Press Stop recording, or close the window, when you are done. Each server is stored as ${SERVER_1}, ${SERVER_2}, and so on.</p>
+        ]]></description>
+</template>

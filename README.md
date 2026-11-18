@@ -61,7 +61,7 @@ The sample response is a transcript: page fetches, hub calls sent, and the serve
 
 ## Limits
 
-- **HTTPS.** The recorder decrypts the tunnel with its own certificate, so the browser has to trust `~/.jmeter/blazor-recorder/ca.crt` once. Inside that tunnel it speaks HTTP/1.1, which is how an HTTP/2 site is recorded. A server that refuses HTTP/1.1 does not produce samplers. Replay still speaks HTTP/2 to the real server when the server allows it.
+- **HTTPS.** The recorder decrypts the tunnel with its own certificate, so the browser has to trust `~/.jmeter/blazor-recorder/ca.crt` once. Inside that tunnel it speaks HTTP/1.1, which is how an HTTP/2 site is recorded. A server that refuses HTTP/1.1 does not produce samplers. Replay still speaks HTTP/2 to the real server when the server allows it. The circuit WebSocket is opened again as HTTP/1.1 when the server rejects a WebSocket on HTTP/2. A site certificate that is not in the Java trust store, such as a local development certificate, is accepted for that replay.
 - **Browser return values.** Render batches are acknowledged. JavaScript calls are completed with a null result, which is enough for the Harbor pages. A call that needs a real DOM return value is not executed in a browser.
 - **Clicks.** A recorded `BeginInvokeDotNetFromJS` is replayed with the same arguments. That works when the new circuit assigns the same event ids. Navigation does not depend on those ids: Navigate rebuilds the root components from the live page.
 - **WebAssembly roots** are not attached. An `auto` root is attached as a server component.

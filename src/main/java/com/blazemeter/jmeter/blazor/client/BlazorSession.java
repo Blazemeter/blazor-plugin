@@ -50,6 +50,7 @@ import org.eclipse.jetty.http.HttpVersion;
 import org.eclipse.jetty.http2.client.HTTP2Client;
 import org.eclipse.jetty.http2.client.transport.ClientConnectionFactoryOverHTTP2;
 import org.eclipse.jetty.io.ClientConnector;
+import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.eclipse.jetty.websocket.api.Callback;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 import org.eclipse.jetty.websocket.api.Session;
@@ -68,9 +69,11 @@ import org.slf4j.LoggerFactory;
  * Render batches and JS calls are acknowledged so the circuit stays open.
  * HTTP and the WebSocket are Jetty 12. HTTP/2 is offered first. TLS
  * negotiates with ALPN and falls back to HTTP/1.1, including the socket
- * when the server does not allow a WebSocket on HTTP/2. Clear-text has no
- * ALPN, so a failed HTTP/2 attempt is retried once as HTTP/1.1 and that
- * authority stays on HTTP/1.1. One shared client serves every direct
+ * when the server does not allow a WebSocket on HTTP/2. A certificate that
+ * is not in the Java trust store is accepted for that session, which is how
+ * a local development site replays. Clear-text has no ALPN, so a failed
+ * HTTP/2 attempt is retried once as HTTP/1.1 and that authority stays on
+ * HTTP/1.1. One shared client serves every direct
  * circuit; a session opened through a proxy gets its own client so other
  * threads are not sent through that proxy. Cookies stay on the session, so
  * virtual users do not share a jar.
@@ -92,6 +95,7 @@ public final class BlazorSession {
     private final StringBuilder transcript = new StringBuilder();
     private final List<String> cookies = new ArrayList<>();
     private final LinkedBlockingQueue<Incoming> incoming = new LinkedBlockingQueue<>();
+    private final AtomicReference<CircuitEndpoint> currentSocket = new AtomicReference<>();
     private final LinkedHashMap<String, ActiveRoot> roots = new LinkedHashMap<>();
 
     private JettyStack transport;
@@ -282,9 +286,11 @@ public final class BlazorSession {
         try {
             this.webSocket = openSocket(webSocketUri, http1);
         } catch (Exception ex) {
-            if (http1 || HttpScheme.isSecure(webSocketUri.getScheme()) || interrupted(ex)) {
+            if (http1 || interrupted(ex)) {
                 throw ex;
             }
+            // Kestrel accepts the page on HTTP/2 and then resets a WebSocket
+            // on that session. The circuit socket is opened again as HTTP/1.1.
             noteHttp1Fallback(webSocketUri, ex);
             this.webSocket = openSocket(webSocketUri, true);
         }
@@ -300,8 +306,10 @@ public final class BlazorSession {
         if (!cookie.isEmpty()) {
             upgrade.setHeader("Cookie", cookie);
         }
-        return transport.sockets.connect(new CircuitEndpoint(incoming), upgrade)
-                .get(timeoutMs, TimeUnit.MILLISECONDS);
+        CircuitEndpoint endpoint = new CircuitEndpoint(incoming, currentSocket);
+        currentSocket.set(endpoint);
+        incoming.clear();
+        return transport.sockets.connect(endpoint, upgrade).get(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
     private void awaitHandshake() throws BlazorException {
@@ -479,6 +487,13 @@ public final class BlazorSession {
         try {
             return send(request);
         } catch (Exception ex) {
+            if (untrustedCertificate(ex) && !transport.trustsServer()) {
+                noteUntrusted(request.getURI());
+                JettyStack previous = transport;
+                transport = JettyStack.open(proxy, true);
+                previous.closeIfOwned();
+                return exchange(requests);
+            }
             if (!canFallback(request, ex)) {
                 throw ex;
             }
@@ -504,6 +519,23 @@ public final class BlazorSession {
         }
         return new HttpResult(response.getStatus(), finalUri, new String(content, StandardCharsets.UTF_8),
                 header(response.getHeaders(), "ssr-framing"), version);
+    }
+
+    private void noteUntrusted(URI uri) {
+        String line = "The certificate for " + uri + " is not in the Java trust store; continuing anyway";
+        log(line);
+        LOG.info(line);
+    }
+
+    private static boolean untrustedCertificate(Throwable failure) {
+        for (Throwable cursor = failure; cursor != null && cursor != cursor.getCause(); cursor = cursor.getCause()) {
+            String message = cursor.getMessage() == null ? "" : cursor.getMessage();
+            if (message.contains("PKIX") || message.contains("certification path")
+                    || cursor.getClass().getSimpleName().contains("CertPath")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void noteHttp1Fallback(URI uri, Exception failure) {
@@ -770,13 +802,18 @@ public final class BlazorSession {
      */
     public static final class CircuitEndpoint implements Session.Listener.AutoDemanding {
         private final LinkedBlockingQueue<Incoming> incoming;
+        private final AtomicReference<CircuitEndpoint> current;
 
-        CircuitEndpoint(LinkedBlockingQueue<Incoming> incoming) {
+        CircuitEndpoint(LinkedBlockingQueue<Incoming> incoming, AtomicReference<CircuitEndpoint> current) {
             this.incoming = incoming;
+            this.current = current;
         }
 
         @Override
         public void onWebSocketText(String message) {
+            if (current.get() != this) {
+                return;
+            }
             incoming.offer(Incoming.data(message.getBytes(StandardCharsets.UTF_8)));
         }
 
@@ -784,17 +821,26 @@ public final class BlazorSession {
         public void onWebSocketBinary(ByteBuffer payload, Callback callback) {
             byte[] copy = new byte[payload.remaining()];
             payload.get(copy);
-            incoming.offer(Incoming.data(copy));
             callback.succeed();
+            if (current.get() != this) {
+                return;
+            }
+            incoming.offer(Incoming.data(copy));
         }
 
         @Override
         public void onWebSocketClose(int statusCode, String reason) {
+            if (current.get() != this) {
+                return;
+            }
             incoming.offer(Incoming.error("WebSocket closed (" + statusCode + " " + reason + ")"));
         }
 
         @Override
         public void onWebSocketError(Throwable error) {
+            if (current.get() != this) {
+                return;
+            }
             String message = error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
             incoming.offer(Incoming.error("WebSocket error: " + message));
         }
@@ -815,20 +861,32 @@ public final class BlazorSession {
         private final HttpClient http;
         private final WebSocketClient sockets;
         private final boolean shared;
+        private final boolean trustServer;
 
-        private JettyStack(HttpClient http, WebSocketClient sockets, boolean shared) {
+        private JettyStack(HttpClient http, WebSocketClient sockets, boolean shared, boolean trustServer) {
             this.http = http;
             this.sockets = sockets;
             this.shared = shared;
+            this.trustServer = trustServer;
+        }
+
+        private boolean trustsServer() {
+            return trustServer;
         }
 
         private static JettyStack open(InetSocketAddress proxy) throws Exception {
-            if (proxy == null) {
+            return open(proxy, false);
+        }
+
+        private static JettyStack open(InetSocketAddress proxy, boolean trustServer) throws Exception {
+            if (proxy == null && !trustServer) {
                 return shared();
             }
-            HttpClient http = newHttpClient();
-            http.getProxyConfiguration().addProxy(new HttpProxy(proxy.getHostString(), proxy.getPort()));
-            return start(http, false);
+            HttpClient http = newHttpClient(trustServer);
+            if (proxy != null) {
+                http.getProxyConfiguration().addProxy(new HttpProxy(proxy.getHostString(), proxy.getPort()));
+            }
+            return start(http, false, trustServer);
         }
 
         private static JettyStack shared() throws Exception {
@@ -838,24 +896,34 @@ public final class BlazorSession {
             }
             synchronized (CLIENTS) {
                 if (sharedStack == null) {
-                    sharedStack = start(newHttpClient(), true);
+                    sharedStack = start(newHttpClient(false), true, false);
                 }
                 return sharedStack;
             }
         }
 
         private static HttpClient newHttpClient() {
+            return newHttpClient(false);
+        }
+
+        private static HttpClient newHttpClient(boolean trustServer) {
             QueuedThreadPool executor = new QueuedThreadPool();
             executor.setName("blazor-jetty");
             executor.setDaemon(true);
             ClientConnector connector = new ClientConnector();
+            if (trustServer) {
+                SslContextFactory.Client ssl = new SslContextFactory.Client();
+                ssl.setTrustAll(true);
+                ssl.setEndpointIdentificationAlgorithm(null);
+                connector.setSslContextFactory(ssl);
+            }
             HTTP2Client http2 = new HTTP2Client(connector);
             http2.setIdleTimeout(120_000);
             http2.setStreamIdleTimeout(120_000);
             http2.setConnectTimeout(10_000);
             // HTTP/2 first, then HTTP/1.1. On TLS, ALPN offers both and the
-            // server picks. A WebSocket on an HTTP/2 session that did not
-            // enable extended CONNECT is retried by Jetty on HTTP/1.1.
+            // server picks. A WebSocket that the server rejects on HTTP/2 is
+            // opened again as HTTP/1.1. Page requests stay on HTTP/2.
             // Clear-text cannot negotiate, so the first attempt is h2c.
             // After that attempt fails, later requests to the authority are
             // pinned to HTTP/1.1.
@@ -887,13 +955,13 @@ public final class BlazorSession {
             return http;
         }
 
-        private static JettyStack start(HttpClient http, boolean sharedClient) throws Exception {
+        private static JettyStack start(HttpClient http, boolean sharedClient, boolean trustServer) throws Exception {
             WebSocketClient sockets = new WebSocketClient(http);
             sockets.setMaxBinaryMessageSize(MAX_BODY);
             sockets.setMaxTextMessageSize(1024 * 1024);
             sockets.setIdleTimeout(Duration.ofSeconds(120));
             sockets.start();
-            return new JettyStack(http, sockets, sharedClient);
+            return new JettyStack(http, sockets, sharedClient, trustServer);
         }
 
         private void closeIfOwned() {
